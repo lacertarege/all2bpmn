@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self' 'unsafe-inline' data: qrc: https:;"
+  >
+  <title>Modelador BPMN</title>
+  <link rel="stylesheet" href="https://unpkg.com/bpmn-js@18.8.0/dist/assets/diagram-js.css">
+  <link rel="stylesheet" href="https://unpkg.com/bpmn-js@18.8.0/dist/assets/bpmn-font/css/bpmn.css">
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #f3f4f6;
+      font-family: "Segoe UI", sans-serif;
+      color: #111827;
+    }
+
+    #layout {
+      display: grid;
+      grid-template-rows: 32px 1fr;
+      height: 100%;
+    }
+
+    #banner {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 12px;
+      border-bottom: 1px solid #d1d5db;
+      background: #ffffff;
+      font-size: 12px;
+    }
+
+    #canvas {
+      height: 100%;
+      width: 100%;
+      background:
+        radial-gradient(circle at top left, rgba(59, 130, 246, 0.08), transparent 28%),
+        linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+    }
+
+    .bjs-powered-by {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="layout">
+    <div id="banner">Spike embebido con bpmn-js. La fuente del diagrama sigue siendo el dominio Python.</div>
+    <div id="canvas"></div>
+  </div>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="https://unpkg.com/bpmn-js@18.8.0/dist/bpmn-modeler.development.js"></script>
+  <script>
+    let bridge = null;
+    const originalConsoleError = console.error.bind(console);
+    const originalConsoleWarn = console.warn.bind(console);
+    const ignoredConsoleMessages = [
+      "ContextPad#getPad is deprecated",
+      "is deprecated and will be removed in future library versions"
+    ];
+
+    function shouldIgnoreConsoleMessage(args) {
+      const message = args.map(String).join(" ");
+      return ignoredConsoleMessages.some((fragment) => message.includes(fragment));
+    }
+
+    console.error = (...args) => {
+      if (shouldIgnoreConsoleMessage(args)) {
+        return;
+      }
+      originalConsoleError(...args);
+    };
+
+    console.warn = (...args) => {
+      if (shouldIgnoreConsoleMessage(args)) {
+        return;
+      }
+      originalConsoleWarn(...args);
+    };
+
+    const modeler = new BpmnJS({
+      container: "#canvas"
+    });
+
+    function reportStatus(message) {
+      if (bridge && bridge.reportStatus) {
+        bridge.reportStatus(String(message));
+      }
+    }
+
+    window.codexBpmn = {
+      async loadXml(xml) {
+        try {
+          await modeler.importXML(xml);
+          const canvas = modeler.get("canvas");
+          canvas.zoom("fit-viewport");
+          reportStatus("BPMN cargado en bpmn-js.");
+        } catch (error) {
+          reportStatus("Fallo importando XML BPMN: " + error.message);
+        }
+      },
+      async exportXml() {
+        try {
+          const result = await modeler.saveXML({ format: true });
+          if (bridge && bridge.deliverXml) {
+            bridge.deliverXml(result.xml);
+          }
+          reportStatus("XML BPMN exportado desde bpmn-js.");
+        } catch (error) {
+          reportStatus("Fallo exportando XML BPMN: " + error.message);
+        }
+      }
+    };
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+      bridge = channel.objects.bridge;
+      reportStatus("bpmn-js cargado. Esperando sincronizacion desde Python.");
+      if (bridge && bridge.notifyReady) {
+        bridge.notifyReady();
+      }
+    });
+  </script>
+</body>
+</html>

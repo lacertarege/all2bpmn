@@ -1,0 +1,15 @@
+.env
+.pdf2bpmn_tmp/
+__pycache__/
+.venv/
+build/
+dist/
+*.pyc
+*.pyo
+*.pyd
+*.bpmn
+*.vsdx
+*.xpdl
+tmp_*
+%USERPROFILE%/
+%USERPROFILE%.pdf_to_bpmn_visio/
