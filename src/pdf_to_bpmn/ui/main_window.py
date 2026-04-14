@@ -57,6 +57,7 @@ from pdf_to_bpmn.ui.web_modeler import BpmnWebModelerWidget
 class LoadedDocument:
     artifacts: RunArtifacts
     diagram: DiagramDocument
+    sketch_mode: bool = False
 
 
 class ExportWorker(QObject):
@@ -121,17 +122,19 @@ class BatchProcessWorker(QObject):
         settings: Settings,
         store: LocalWorkspaceStore,
         input_paths: list[Path],
+        sketch_mode: bool,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.store = store
         self.input_paths = input_paths
+        self.sketch_mode = sketch_mode
 
     def run(self) -> None:
         results: list[LoadedDocument] = []
         try:
             rasterizer = SinglePagePdfRasterizer(self.settings.working_dpi)
-            analyzer = HybridDiagramAnalyzer(self.settings)
+            analyzer = HybridDiagramAnalyzer(self.settings, sketch_mode=self.sketch_mode)
             total = len(self.input_paths)
             for index, input_path in enumerate(self.input_paths, start=1):
                 self.progress.emit(input_path.name, index, total)
@@ -141,8 +144,15 @@ class BatchProcessWorker(QObject):
                 artifacts = self.store.create_run(resolved_input)
                 rasterizer.rasterize(artifacts.source_pdf, artifacts.source_image)
                 diagram = analyzer.analyze(artifacts.source_pdf, artifacts.source_image)
+                diagram.metadata["analysis_mode"] = "sketch" if self.sketch_mode else "standard"
                 self.store.save_diagram(diagram, artifacts.diagram_json)
-                results.append(LoadedDocument(artifacts=artifacts, diagram=diagram))
+                results.append(
+                    LoadedDocument(
+                        artifacts=artifacts,
+                        diagram=diagram,
+                        sketch_mode=self.sketch_mode,
+                    )
+                )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -159,24 +169,33 @@ class ReprocessWorker(QObject):
         store: LocalWorkspaceStore,
         artifacts: RunArtifacts,
         current_diagram: DiagramDocument,
+        sketch_mode: bool,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.store = store
         self.artifacts = artifacts
         self.current_diagram = current_diagram
+        self.sketch_mode = sketch_mode
 
     def run(self) -> None:
         try:
             rasterizer = SinglePagePdfRasterizer(self.settings.working_dpi)
             rasterizer.rasterize(self.artifacts.source_pdf, self.artifacts.source_image)
-            analyzer = HybridDiagramAnalyzer(self.settings)
+            analyzer = HybridDiagramAnalyzer(self.settings, sketch_mode=self.sketch_mode)
             refined = analyzer.refine(self.artifacts.source_pdf, self.artifacts.source_image, self.current_diagram)
+            refined.metadata["analysis_mode"] = "sketch" if self.sketch_mode else "standard"
             self.store.save_diagram(refined, self.artifacts.diagram_json)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
-        self.finished.emit(LoadedDocument(artifacts=self.artifacts, diagram=refined))
+        self.finished.emit(
+            LoadedDocument(
+                artifacts=self.artifacts,
+                diagram=refined,
+                sketch_mode=self.sketch_mode,
+            )
+        )
 
 
 class ReviewMainWindow(QMainWindow):
@@ -210,7 +229,10 @@ class ReviewMainWindow(QMainWindow):
         self._updating_form = False
         self._current_kind: str | None = None
         self._current_id: str | None = None
-        self._documents: list[LoadedDocument] = [LoadedDocument(artifacts=artifacts, diagram=diagram)]
+        initial_sketch_mode = str(diagram.metadata.get("analysis_mode") or "standard") == "sketch"
+        self._documents: list[LoadedDocument] = [
+            LoadedDocument(artifacts=artifacts, diagram=diagram, sketch_mode=initial_sketch_mode)
+        ]
         self._current_document_index = 0
 
         self.setWindowTitle("PDF a BPMN Visio")
@@ -246,6 +268,12 @@ class ReviewMainWindow(QMainWindow):
         self.document_selector = QComboBox()
         self.document_selector.currentIndexChanged.connect(self._on_document_selected)
         self.processing_label = QLabel(f"Documento activo: {self._document_label(artifacts)}")
+        self.sketch_mode_check = QCheckBox("Boceto a mano")
+        self.sketch_mode_check.setChecked(initial_sketch_mode)
+        self.sketch_mode_check.setToolTip(
+            "Usa un analisis mas tolerante para diagramas dibujados a mano o con texto manuscrito."
+        )
+        self.sketch_mode_check.toggled.connect(self._on_sketch_mode_toggled)
         self.credits_link = QLabel('<a href="#">Creditos</a>')
         self.credits_link.setTextFormat(Qt.TextFormat.RichText)
         self.credits_link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
@@ -271,18 +299,30 @@ class ReviewMainWindow(QMainWindow):
         self.next_button.clicked.connect(self._go_to_next_document)
 
         side_panel = QWidget()
-        side_layout = QVBoxLayout(side_panel)
+        side_layout = QHBoxLayout(side_panel)
         side_layout.setContentsMargins(0, 0, 0, 0)
-        side_layout.addWidget(QLabel("Archivos cargados"))
-        side_layout.addWidget(self.document_selector)
-        side_layout.addWidget(self.processing_label)
-        side_layout.addWidget(self.credits_link)
-        side_layout.addWidget(side_tabs)
-        side_layout.addWidget(self.export_bizagi_button)
-        side_layout.addWidget(self.export_xpdl_button)
-        side_layout.addWidget(self.export_visio_button)
-        side_layout.addWidget(self.reprocess_button)
-        side_layout.addWidget(self.next_button)
+
+        side_left = QWidget()
+        side_left_layout = QVBoxLayout(side_left)
+        side_left_layout.setContentsMargins(0, 0, 0, 0)
+        side_left_layout.addWidget(QLabel("Archivos cargados"))
+        side_left_layout.addWidget(self.document_selector)
+        side_left_layout.addWidget(self.processing_label)
+        side_left_layout.addWidget(self.sketch_mode_check)
+        side_left_layout.addWidget(self.credits_link)
+        side_left_layout.addWidget(side_tabs)
+
+        actions_group = QGroupBox("Acciones")
+        actions_layout = QVBoxLayout(actions_group)
+        actions_layout.addWidget(self.export_bizagi_button)
+        actions_layout.addWidget(self.export_xpdl_button)
+        actions_layout.addWidget(self.export_visio_button)
+        actions_layout.addWidget(self.reprocess_button)
+        actions_layout.addWidget(self.next_button)
+        actions_layout.addStretch(1)
+
+        side_layout.addWidget(side_left, 1)
+        side_layout.addWidget(actions_group, 0)
 
         self.side_panel = side_panel
         self.top_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -377,6 +417,12 @@ class ReviewMainWindow(QMainWindow):
         self.modeler_focus_action.triggered.connect(self._toggle_modeler_focus_mode)
         self.addAction(self.modeler_focus_action)
 
+        self.sketch_mode_action = QAction("Modo boceto a mano", self)
+        self.sketch_mode_action.setCheckable(True)
+        self.sketch_mode_action.setChecked(self.sketch_mode_check.isChecked())
+        self.sketch_mode_action.triggered.connect(self._set_sketch_mode_from_action)
+        self.addAction(self.sketch_mode_action)
+
         toolbar = self.addToolBar("Principal")
         toolbar.addAction(open_action)
         toolbar.addAction(save_action)
@@ -386,6 +432,7 @@ class ReviewMainWindow(QMainWindow):
         toolbar.addAction(export_visio_action)
         toolbar.addAction(reprocess_action)
         toolbar.addAction(next_action)
+        toolbar.addAction(self.sketch_mode_action)
         toolbar.addAction(self.modeler_focus_action)
 
     def _toggle_modeler_focus_mode(self, checked: bool | None = None) -> None:
@@ -615,6 +662,7 @@ class ReviewMainWindow(QMainWindow):
 
     def _on_scene_changed(self) -> None:
         self._documents[self._current_document_index].diagram = self.diagram
+        self.bizagi_validator.normalize_for_bizagi(self.diagram)
         self._clear_profile_issues(BizagiStrictValidator.PROFILE)
         self._reload_lists()
         self._refresh_issue_list()
@@ -641,16 +689,44 @@ class ReviewMainWindow(QMainWindow):
         issues = self._selected_issues()
         if not issues:
             return
+        node_ids, edge_ids = self._issue_targets(issues)
+        if node_ids or edge_ids:
+            self.scene.select_entities(node_ids, edge_ids)
         if len(issues) > 1:
             self.selection_title.setText(f"{len(issues)} problemas seleccionados")
             return
         issue = issues[0]
         if issue.related_kind == "node" and issue.related_id:
-            self.scene.select_node(issue.related_id)
             self._set_selection("node", issue.related_id)
         elif issue.related_kind == "edge" and issue.related_id:
-            self.scene.select_edge(issue.related_id)
             self._set_selection("edge", issue.related_id)
+        else:
+            self.selection_title.setText("Problema seleccionado")
+
+    def _issue_targets(self, issues: list[ReviewIssue]) -> tuple[set[str], set[str]]:
+        node_ids: set[str] = set()
+        edge_ids: set[str] = set()
+        for issue in issues:
+            if issue.related_kind == "node" and issue.related_id:
+                node_ids.add(issue.related_id)
+            elif issue.related_kind == "edge" and issue.related_id:
+                edge_ids.add(issue.related_id)
+                edge = self.diagram.find_edge(issue.related_id)
+                if edge:
+                    if edge.source_id:
+                        node_ids.add(edge.source_id)
+                    if edge.target_id:
+                        node_ids.add(edge.target_id)
+            metadata = issue.metadata or {}
+            for key in ("related_node_ids", "node_ids"):
+                values = metadata.get(key) or []
+                if isinstance(values, (list, tuple, set)):
+                    node_ids.update(str(value) for value in values if value)
+            for key in ("related_edge_ids", "edge_ids"):
+                values = metadata.get(key) or []
+                if isinstance(values, (list, tuple, set)):
+                    edge_ids.update(str(value) for value in values if value)
+        return node_ids, edge_ids
 
     def _apply_node_form(self) -> None:
         if self._updating_form or self._current_kind != "node" or not self._current_id:
@@ -685,9 +761,29 @@ class ReviewMainWindow(QMainWindow):
         self._reload_lists()
 
     def _save_draft(self) -> None:
+        self.diagram.metadata["analysis_mode"] = "sketch" if self.sketch_mode_check.isChecked() else "standard"
         self._documents[self._current_document_index].diagram = self.diagram
+        self._documents[self._current_document_index].sketch_mode = self.sketch_mode_check.isChecked()
         self.store.save_diagram(self.diagram, self.artifacts.diagram_json)
         self.statusBar().showMessage(f"Borrador guardado en {self.artifacts.diagram_json}", 5000)
+
+    def _set_sketch_mode_from_action(self, checked: bool) -> None:
+        self.sketch_mode_check.blockSignals(True)
+        self.sketch_mode_check.setChecked(bool(checked))
+        self.sketch_mode_check.blockSignals(False)
+        self._on_sketch_mode_toggled(bool(checked))
+
+    def _on_sketch_mode_toggled(self, checked: bool) -> None:
+        enabled = bool(checked)
+        self.sketch_mode_action.blockSignals(True)
+        self.sketch_mode_action.setChecked(enabled)
+        self.sketch_mode_action.blockSignals(False)
+        self.diagram.metadata["analysis_mode"] = "sketch" if enabled else "standard"
+        self._documents[self._current_document_index].sketch_mode = enabled
+        self._documents[self._current_document_index].diagram = self.diagram
+        self.store.save_diagram(self.diagram, self.artifacts.diagram_json)
+        mode_label = "Boceto a mano" if enabled else "Analisis estandar"
+        self.statusBar().showMessage(f"Modo activo para este documento: {mode_label}", 4000)
 
     def _open_inputs(self) -> None:
         selected, _ = QFileDialog.getOpenFileNames(
@@ -928,6 +1024,7 @@ class ReviewMainWindow(QMainWindow):
 
     def _process_input_batch(self, input_paths: list[Path]) -> None:
         self._save_draft()
+        batch_sketch_mode = self.sketch_mode_check.isChecked()
         self._batch_progress = QProgressDialog("Preparando procesamiento...", None, 0, 0, self)
         self._batch_progress.setWindowTitle("Procesando archivo(s)")
         self._batch_progress.setMinimumDuration(0)
@@ -937,7 +1034,12 @@ class ReviewMainWindow(QMainWindow):
         self._batch_progress.show()
 
         self._batch_thread = QThread(self)
-        self._batch_worker = BatchProcessWorker(self.settings, self.store, input_paths)
+        self._batch_worker = BatchProcessWorker(
+            self.settings,
+            self.store,
+            input_paths,
+            batch_sketch_mode,
+        )
         self._batch_worker.moveToThread(self._batch_thread)
         self._batch_thread.started.connect(self._batch_worker.run)
         self._batch_worker.progress.connect(self._on_batch_progress)
@@ -974,6 +1076,7 @@ class ReviewMainWindow(QMainWindow):
             self.store,
             self.artifacts,
             self.diagram,
+            self.sketch_mode_check.isChecked(),
         )
         self._reprocess_worker.moveToThread(self._reprocess_thread)
         self._reprocess_thread.started.connect(self._reprocess_worker.run)
@@ -1003,9 +1106,20 @@ class ReviewMainWindow(QMainWindow):
             self._load_document(loaded[0].artifacts, loaded[0].diagram)
             self.statusBar().showMessage(f"Se reproceso {loaded[0].artifacts.source_pdf.name}.", 5000)
             return
-        self._documents.extend(loaded)
+        is_placeholder_only = (
+            len(self._documents) == 1
+            and self._documents[0].artifacts.source_pdf.name == "sin_entrada.dat"
+        )
+        if is_placeholder_only:
+            self._documents = loaded
+            self._current_document_index = 0
+        else:
+            start_index = len(self._documents)
+            self._documents.extend(loaded)
+            self._current_document_index = start_index
         self._reload_document_selector()
-        self.document_selector.setCurrentIndex(len(self._documents) - len(loaded))
+        loaded_current = self._documents[self._current_document_index]
+        self._load_document(loaded_current.artifacts, loaded_current.diagram)
         self.statusBar().showMessage(f"Se procesaron {len(loaded)} archivo(s).", 5000)
 
     def _on_batch_failed(self, message: str) -> None:
@@ -1050,9 +1164,12 @@ class ReviewMainWindow(QMainWindow):
     def _apply_imported_web_diagram(self, imported: object) -> None:
         if not isinstance(imported, DiagramDocument):
             return
+        self.bizagi_validator.normalize_for_bizagi(imported)
+        imported.metadata["analysis_mode"] = "sketch" if self.sketch_mode_check.isChecked() else "standard"
         self._documents[self._current_document_index] = LoadedDocument(
             artifacts=self.artifacts,
             diagram=imported,
+            sketch_mode=self.sketch_mode_check.isChecked(),
         )
         self._load_document(self.artifacts, imported)
         self.store.save_diagram(self.diagram, self.artifacts.diagram_json)
@@ -1094,9 +1211,17 @@ class ReviewMainWindow(QMainWindow):
         self.artifacts = artifacts
         self.diagram = diagram
         normalize_event_nodes(self.diagram.nodes)
+        self.bizagi_validator.normalize_for_bizagi(self.diagram)
         self.diagram_title = str(diagram.metadata.get("title") or "Diagrama BPMN")
         self.processing_label.setText(f"Documento activo: {self._document_label(artifacts)}")
         self.source_panel.setTitle(f"Archivo origen: {self._document_label(artifacts)}")
+        sketch_mode = str(self.diagram.metadata.get("analysis_mode") or "standard") == "sketch"
+        self.sketch_mode_check.blockSignals(True)
+        self.sketch_mode_check.setChecked(sketch_mode)
+        self.sketch_mode_check.blockSignals(False)
+        self.sketch_mode_action.blockSignals(True)
+        self.sketch_mode_action.setChecked(sketch_mode)
+        self.sketch_mode_action.blockSignals(False)
         self.scene = DiagramScene(diagram)
         self.scene.node_selected.connect(self._on_node_selected)
         self.scene.edge_selected.connect(self._on_edge_selected)
@@ -1143,11 +1268,11 @@ class ReviewMainWindow(QMainWindow):
                 return
             self.statusBar().showMessage("No hay mas archivos en cola.", 5000)
             return
-        if reset_when_finished and next_index >= len(self._documents) - 1:
-            self._reset_to_initial_state()
-            self.statusBar().showMessage("Se completo la cola de archivos. La aplicacion quedo lista para una nueva carga.", 5000)
-            return
-        self.document_selector.setCurrentIndex(next_index)
+        self._save_draft()
+        self._current_document_index = next_index
+        self._reload_document_selector()
+        loaded = self._documents[next_index]
+        self._load_document(loaded.artifacts, loaded.diagram)
         next_name = self._documents[next_index].artifacts.source_pdf.name
         self.statusBar().showMessage(f"Siguiente archivo en cola: {next_name}", 5000)
 
@@ -1167,10 +1292,10 @@ class ReviewMainWindow(QMainWindow):
             source_image=artifacts.source_image,
             image_width=1600,
             image_height=900,
-            metadata={"title": "Diagrama BPMN"},
+            metadata={"title": "Diagrama BPMN", "analysis_mode": "standard"},
         )
         self.store.save_diagram(diagram, artifacts.diagram_json)
-        self._documents = [LoadedDocument(artifacts=artifacts, diagram=diagram)]
+        self._documents = [LoadedDocument(artifacts=artifacts, diagram=diagram, sketch_mode=False)]
         self._current_document_index = 0
         self._reload_document_selector()
         self._load_document(artifacts, diagram)

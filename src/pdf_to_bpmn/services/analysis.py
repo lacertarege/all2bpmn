@@ -26,11 +26,13 @@ from pdf_to_bpmn.domain import (
     normalize_event_nodes,
 )
 from pdf_to_bpmn.services.azure_document import AzureDocumentIntelligenceClient, OcrLine
+from pdf_to_bpmn.services.image_io import cv2_imread
 
 
 class AzureFoundryVisionRecognizer:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, sketch_mode: bool = False) -> None:
         self.settings = settings
+        self.sketch_mode = sketch_mode
 
     def is_configured(self) -> bool:
         return self.settings.has_foundry_vision
@@ -40,8 +42,8 @@ class AzureFoundryVisionRecognizer:
             return None
 
         width, height = _read_image_dimensions(image_path)
-        system_prompt = _bpmn_extraction_prompt()
-        user_content = _build_foundry_user_content(pdf_path, image_path, width, height)
+        system_prompt = _bpmn_extraction_prompt(self.sketch_mode)
+        user_content = _build_foundry_user_content(pdf_path, image_path, width, height, self.sketch_mode)
         return self._request_proposal(system_prompt, user_content)
 
     def refine(self, pdf_path: Path, image_path: Path, current_diagram: DiagramDocument) -> dict | None:
@@ -49,8 +51,8 @@ class AzureFoundryVisionRecognizer:
             return None
 
         width, height = _read_image_dimensions(image_path)
-        system_prompt = _bpmn_refinement_prompt()
-        user_content = _build_foundry_user_content(pdf_path, image_path, width, height)
+        system_prompt = _bpmn_refinement_prompt(self.sketch_mode)
+        user_content = _build_foundry_user_content(pdf_path, image_path, width, height, self.sketch_mode)
         user_content.append(
             {
                 "type": "input_text",
@@ -148,7 +150,15 @@ class AzureFoundryVisionRecognizer:
         content = _extract_chat_completion_text(raw)
         return json.loads(content)
 
-def _bpmn_extraction_prompt() -> str:
+def _bpmn_extraction_prompt(sketch_mode: bool = False) -> str:
+    sketch_hint = (
+        " El origen puede ser un boceto a mano alzada o texto manuscrito. "
+        "Tolera bordes irregulares, cajas incompletas, flechas torcidas y letras partidas. "
+        "No exijas geometria perfecta para reconocer tareas, eventos o gateways. "
+        "Prioriza el flujo visual principal aunque el dibujo sea informal."
+        if sketch_mode
+        else ""
+    )
     return (
         "Analiza un diagrama BPMN 2.0 proveniente de un PDF escaneado o fotografiado. "
         "Responde solo con un objeto JSON que cumpla exactamente el esquema solicitado. "
@@ -161,11 +171,19 @@ def _bpmn_extraction_prompt() -> str:
         "start_event, intermediate_event, end_event, boundary_event, exclusive_gateway, "
         "parallel_gateway, inclusive_gateway, event_based_gateway, data_object, data_store, annotation. "
         "Tipos de edge permitidos: sequence_flow, message_flow, association. "
+        + sketch_hint
         + _bpmn_visual_reconstruction_rules()
     )
 
 
-def _bpmn_refinement_prompt() -> str:
+def _bpmn_refinement_prompt(sketch_mode: bool = False) -> str:
+    sketch_hint = (
+        " El diagrama puede venir de un boceto a mano alzada. "
+        "Mejora sin forzar limpieza artificial: conserva la intencion del trazo, el orden del flujo y el texto manuscrito legible. "
+        "Cuando una forma sea irregular pero consistente con tarea, evento o gateway, manten la interpretacion mas probable."
+        if sketch_mode
+        else ""
+    )
     return (
         "Analiza y mejora un diagrama BPMN 2.0 extraido desde un PDF. "
         "Recibiras la imagen/PDF original y un JSON con el diagrama actual. "
@@ -180,6 +198,7 @@ def _bpmn_refinement_prompt() -> str:
         "start_event, intermediate_event, end_event, boundary_event, exclusive_gateway, "
         "parallel_gateway, inclusive_gateway, event_based_gateway, data_object, data_store, annotation. "
         "Tipos de edge permitidos: sequence_flow, message_flow, association. "
+        + sketch_hint
         + _bpmn_visual_reconstruction_rules()
     )
 
@@ -198,7 +217,7 @@ def _bpmn_visual_reconstruction_rules() -> str:
 
 
 def _build_foundry_user_content(
-    pdf_path: Path, image_path: Path, width: int, height: int
+    pdf_path: Path, image_path: Path, width: int, height: int, sketch_mode: bool = False
 ) -> list[dict]:
     content: list[dict] = []
     if pdf_path.exists() and pdf_path.suffix.lower() == ".pdf":
@@ -225,6 +244,11 @@ def _build_foundry_user_content(
             "text": (
                 "Extrae el BPMN lo mejor posible. "
                 f"Usa coordenadas en pixeles sobre una referencia rasterizada de {width}x{height}."
+                + (
+                    " El documento debe interpretarse como boceto a mano: espera trazos imperfectos y texto manuscrito."
+                    if sketch_mode
+                    else ""
+                )
             ),
         }
     )
@@ -447,13 +471,16 @@ def _build_chat_completion_messages(system_prompt: str, user_content: list[dict]
 
 
 class HybridDiagramAnalyzer:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, sketch_mode: bool = False) -> None:
         self.settings = settings
+        self.sketch_mode = sketch_mode
         self.ocr_client = AzureDocumentIntelligenceClient(settings)
-        self.vision_client = AzureFoundryVisionRecognizer(settings)
+        self.vision_client = AzureFoundryVisionRecognizer(settings, sketch_mode=sketch_mode)
 
     def analyze(self, pdf_path: Path, image_path: Path) -> DiagramDocument:
         ocr_lines = self.ocr_client.read_lines(image_path)
+        if self.sketch_mode:
+            ocr_lines = _prepare_sketch_ocr_lines(ocr_lines)
 
         proposal = None
         if self.vision_client.is_configured():
@@ -493,11 +520,14 @@ class HybridDiagramAnalyzer:
         self._merge_geometric_association_candidates(diagram)
         self._validate_semantics(diagram)
         diagram.metadata["title"] = _infer_diagram_title(diagram, ocr_lines)
+        diagram.metadata["analysis_mode"] = "sketch" if self.sketch_mode else "standard"
         self._promote_review_issues(diagram)
         return diagram
 
     def refine(self, pdf_path: Path, image_path: Path, current_diagram: DiagramDocument) -> DiagramDocument:
         ocr_lines = self.ocr_client.read_lines(image_path)
+        if self.sketch_mode:
+            ocr_lines = _prepare_sketch_ocr_lines(ocr_lines)
         proposal = None
         if self.vision_client.is_configured():
             try:
@@ -535,6 +565,7 @@ class HybridDiagramAnalyzer:
         self._merge_geometric_association_candidates(diagram)
         self._validate_semantics(diagram)
         diagram.metadata["title"] = _infer_diagram_title(diagram, ocr_lines)
+        diagram.metadata["analysis_mode"] = "sketch" if self.sketch_mode else "standard"
         self._promote_review_issues(diagram)
         return diagram
 
@@ -599,8 +630,13 @@ class HybridDiagramAnalyzer:
         self, pdf_path: Path, image_path: Path, ocr_lines: list[OcrLine]
     ) -> DiagramDocument:
         width, height = _read_image_dimensions(image_path)
-        nodes, contours_found = _detect_node_candidates(image_path, width, height)
-        edges = _detect_connectors(image_path, nodes)
+        nodes, contours_found = _detect_node_candidates(
+            image_path,
+            width,
+            height,
+            sketch_mode=self.sketch_mode,
+        )
+        edges = _detect_connectors(image_path, nodes, sketch_mode=self.sketch_mode)
         issues: list[ReviewIssue] = []
 
         if not contours_found:
@@ -641,7 +677,10 @@ class HybridDiagramAnalyzer:
             nodes=nodes,
             edges=edges,
             issues=issues,
-            metadata={"bootstrap": "heuristic"},
+            metadata={
+                "bootstrap": "heuristic",
+                "analysis_mode": "sketch" if self.sketch_mode else "standard",
+            },
         )
 
     def _merge_ocr_text(self, diagram: DiagramDocument, lines: list[OcrLine]) -> None:
@@ -1013,9 +1052,17 @@ class HybridDiagramAnalyzer:
 
     def _sanitize_semantic_conflicts(self, diagram: DiagramDocument, ocr_lines: list[OcrLine]) -> None:
         self._remove_false_header_data_stores(diagram, ocr_lines)
+        self._repair_primary_row_activity_labels(diagram, ocr_lines)
         self._demote_invalid_start_events(diagram)
+        self._remove_branch_label_nodes(diagram)
 
     def _remove_false_header_data_stores(self, diagram: DiagramDocument, ocr_lines: list[OcrLine]) -> None:
+        connected_ids = {
+            node_id
+            for edge in diagram.edges
+            if not edge.deleted
+            for node_id in (edge.source_id, edge.target_id)
+        }
         for node in diagram.nodes:
             if node.deleted or node.node_type != NodeType.DATA_STORE:
                 continue
@@ -1030,6 +1077,8 @@ class HybridDiagramAnalyzer:
                 and (
                     not normalized
                     or overlaps_header
+                    or node.id not in connected_ids
+                    or not _looks_like_data_store_from_visuals(normalized)
                     or _looks_like_document_header_artifact(
                         node,
                         normalized,
@@ -1039,6 +1088,55 @@ class HybridDiagramAnalyzer:
                 )
             ):
                 node.deleted = True
+
+    def _repair_primary_row_activity_labels(
+        self, diagram: DiagramDocument, ocr_lines: list[OcrLine]
+    ) -> None:
+        primary_row_ids = {node.id for node in _find_primary_sequence_row(diagram)}
+        if not primary_row_ids:
+            return
+
+        activity_types = {
+            NodeType.TASK,
+            NodeType.USER_TASK,
+            NodeType.SERVICE_TASK,
+            NodeType.SUBPROCESS,
+            NodeType.COLLAPSED_SUBPROCESS,
+        }
+        for node in diagram.nodes:
+            if node.deleted or node.id not in primary_row_ids or node.node_type not in activity_types:
+                continue
+
+            normalized = _normalize_text(node.text)
+            if normalized and not _is_branch_label_text(normalized) and not _is_activity_code_text(normalized):
+                continue
+
+            candidate_lines = [
+                line
+                for line in ocr_lines
+                if _intersection_area(
+                    node.x - 8.0,
+                    node.y - 8.0,
+                    node.width + 16.0,
+                    node.height + 16.0,
+                    line.x,
+                    line.y,
+                    line.width,
+                    line.height,
+                ) > 0
+            ]
+            if not candidate_lines:
+                continue
+
+            repaired_text, metadata = _extract_node_text_from_ocr(
+                node, candidate_lines, diagram.image_height
+            )
+            repaired_normalized = _normalize_text(repaired_text)
+            if not repaired_normalized or _is_branch_label_text(repaired_normalized):
+                continue
+            node.text = repaired_text
+            if metadata:
+                node.metadata.update(metadata)
 
     def _demote_invalid_start_events(self, diagram: DiagramDocument) -> None:
         incoming: dict[str, int] = defaultdict(int)
@@ -1069,7 +1167,26 @@ class HybridDiagramAnalyzer:
                 node.metadata["demoted_from"] = "start_event"
                 node.confidence = min(max(node.confidence, 0.68) + 0.06, 0.95)
 
+    def _remove_branch_label_nodes(self, diagram: DiagramDocument) -> None:
+        branch_labels = {"si", "no", "yes", "true", "false"}
+        removable_types = {
+            NodeType.TASK,
+            NodeType.USER_TASK,
+            NodeType.SERVICE_TASK,
+            NodeType.SUBPROCESS,
+            NodeType.COLLAPSED_SUBPROCESS,
+            NodeType.ANNOTATION,
+            NodeType.DATA_OBJECT,
+        }
+        for node in diagram.nodes:
+            if node.deleted or node.node_type not in removable_types:
+                continue
+            normalized = _normalize_text(node.text)
+            if normalized in branch_labels:
+                node.deleted = True
+
     def _infer_container_semantics(self, diagram: DiagramDocument, ocr_lines: list[OcrLine]) -> None:
+        self._suppress_false_lanes(diagram)
         pools = [node for node in diagram.nodes if node.node_type == NodeType.POOL and not node.deleted]
         lanes = [node for node in diagram.nodes if node.node_type == NodeType.LANE and not node.deleted]
 
@@ -1130,6 +1247,28 @@ class HybridDiagramAnalyzer:
             if container.text.strip():
                 continue
             container.text = _best_container_label(container, ocr_lines)
+
+    def _suppress_false_lanes(self, diagram: DiagramDocument) -> None:
+        candidate_nodes = [
+            node
+            for node in diagram.nodes
+            if not node.deleted and node.node_type not in {NodeType.POOL, NodeType.LANE}
+        ]
+        for lane in [node for node in diagram.nodes if node.node_type == NodeType.LANE and not node.deleted]:
+            normalized = _normalize_text(lane.text)
+            if "responsable de" in normalized or "encargado de" in normalized:
+                continue
+            if lane.width > max(56.0, diagram.image_width * 0.08):
+                continue
+            if lane.height < diagram.image_height * 0.28:
+                continue
+            contained_nodes = [
+                node for node in candidate_nodes
+                if _node_contains_point(lane, node.center.x, node.center.y)
+            ]
+            if contained_nodes:
+                continue
+            lane.deleted = True
 
     def _apply_horizontal_lane_header_pattern(
         self,
@@ -1487,7 +1626,7 @@ def _read_image_dimensions(image_path: Path) -> tuple[int, int]:
     except ImportError as exc:
         raise RuntimeError("OpenCV es requerido para leer dimensiones de imagen.") from exc
 
-    image = cv2.imread(str(image_path))
+    image = cv2_imread(image_path, cv2.IMREAD_COLOR)
     if image is None:
         raise RuntimeError(f"No se pudo abrir la imagen rasterizada: {image_path}")
     height, width = image.shape[:2]
@@ -1526,43 +1665,104 @@ def _infer_diagram_title(diagram: DiagramDocument, lines: list[OcrLine]) -> str:
     return "Diagrama BPMN"
 
 
+def _prepare_sketch_ocr_lines(lines: list[OcrLine]) -> list[OcrLine]:
+    if not lines:
+        return []
+    ordered = sorted(lines, key=lambda item: (item.y, item.x))
+    merged: list[OcrLine] = []
+    for line in ordered:
+        text = " ".join(line.text.split()).strip()
+        if not text:
+            continue
+        if not merged:
+            merged.append(
+                OcrLine(
+                    text=text,
+                    x=line.x,
+                    y=line.y,
+                    width=line.width,
+                    height=line.height,
+                    confidence=line.confidence,
+                )
+            )
+            continue
+        previous = merged[-1]
+        y_gap = abs(previous.center[1] - line.center[1])
+        x_gap = line.x - (previous.x + previous.width)
+        height_ratio = min(previous.height, line.height) / max(previous.height, line.height, 1.0)
+        if y_gap <= max(previous.height, line.height) * 0.75 and -12.0 <= x_gap <= 36.0 and height_ratio >= 0.55:
+            previous.text = f"{previous.text} {text}".strip()
+            previous.width = max(previous.x + previous.width, line.x + line.width) - previous.x
+            previous.height = max(previous.y + previous.height, line.y + line.height) - min(previous.y, line.y)
+            previous.y = min(previous.y, line.y)
+            if previous.confidence is not None and line.confidence is not None:
+                previous.confidence = min(previous.confidence, line.confidence)
+            continue
+        merged.append(
+            OcrLine(
+                text=text,
+                x=line.x,
+                y=line.y,
+                width=line.width,
+                height=line.height,
+                confidence=line.confidence,
+            )
+        )
+    return merged
+
+
 def _detect_node_candidates(
-    image_path: Path, image_width: int, image_height: int
+    image_path: Path, image_width: int, image_height: int, sketch_mode: bool = False
 ) -> tuple[list[DiagramNode], bool]:
     try:
         import cv2
     except ImportError as exc:
         raise RuntimeError("OpenCV es requerido para detectar formas BPMN.") from exc
 
-    image = cv2.imread(str(image_path))
+    image = cv2_imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"No se pudo abrir la imagen rasterizada: {image_path}")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    blur_kernel = (7, 7) if sketch_mode else (5, 5)
+    blur = cv2.GaussianBlur(gray, blur_kernel, 0)
     binary = cv2.adaptiveThreshold(
         blur,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        31,
-        11,
+        35 if sketch_mode else 31,
+        8 if sketch_mode else 11,
     )
+    if sketch_mode:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
     contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
     nodes: list[DiagramNode] = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 1200:
+        if area < (900 if sketch_mode else 1200):
             continue
         x, y, width, height = cv2.boundingRect(contour)
-        if width < 28 or height < 18:
+        if width < (24 if sketch_mode else 28) or height < (16 if sketch_mode else 18):
             continue
         if width > image_width * 0.95 and height > image_height * 0.95:
             continue
 
         perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
+        approx = cv2.approxPolyDP(contour, (0.045 if sketch_mode else 0.03) * perimeter, True)
         fill_ratio = area / max(width * height, 1)
-        node_type = _classify_contour(width, height, len(approx), fill_ratio, image_width)
+        node_type = _classify_contour(
+            width,
+            height,
+            len(approx),
+            fill_ratio,
+            image_width,
+            sketch_mode=sketch_mode,
+        )
         confidence = _initial_confidence(node_type, fill_ratio)
+        if sketch_mode:
+            confidence = min(max(confidence, 0.52) + 0.03, 0.9)
         nodes.append(
             DiagramNode(
                 id=f"node-{uuid.uuid4().hex[:8]}",
@@ -1583,7 +1783,12 @@ def _detect_node_candidates(
 
 
 def _classify_contour(
-    width: int, height: int, vertices: int, fill_ratio: float, image_width: int
+    width: int,
+    height: int,
+    vertices: int,
+    fill_ratio: float,
+    image_width: int,
+    sketch_mode: bool = False,
 ) -> NodeType:
     aspect_ratio = width / max(height, 1)
     if aspect_ratio > 5.5 and width > image_width * 0.30:
@@ -1596,6 +1801,11 @@ def _classify_contour(
         return NodeType.EXCLUSIVE_GATEWAY
     if vertices >= 7 and 0.55 <= fill_ratio <= 0.95:
         return NodeType.START_EVENT
+    if sketch_mode:
+        if 0.7 <= aspect_ratio <= 1.4 and width >= 26 and height >= 26 and vertices >= 5:
+            return NodeType.START_EVENT
+        if 0.7 <= aspect_ratio <= 1.35 and width >= 30 and height >= 30 and 4 <= vertices <= 6:
+            return NodeType.EXCLUSIVE_GATEWAY
     return NodeType.TASK
 
 
@@ -1943,6 +2153,14 @@ def _extract_node_text_from_ocr(
         if _is_global_document_header_text(text, line.y, image_height):
             ignored_regions.add("document_header")
             continue
+        if node.node_type not in {
+            NodeType.EXCLUSIVE_GATEWAY,
+            NodeType.PARALLEL_GATEWAY,
+            NodeType.INCLUSIVE_GATEWAY,
+            NodeType.EVENT_BASED_GATEWAY,
+        } and _is_branch_label_text(normalized):
+            ignored_regions.add("branch_label")
+            continue
         if node.node_type not in EVENT_NODE_TYPES and normalized in {"inicio", "inicia", "fin", "final"}:
             ignored_regions.add("foreign_event_label")
             continue
@@ -1963,6 +2181,27 @@ def _extract_node_text_from_ocr(
     else:
         selected = preferred or kept_lines
     values = [" ".join(line.text.split()).strip() for line in selected if line.text.strip()]
+    normalized_values = [_normalize_text(value) for value in values if value]
+
+    if node.node_type in {
+        NodeType.TASK,
+        NodeType.USER_TASK,
+        NodeType.SERVICE_TASK,
+        NodeType.SUBPROCESS,
+        NodeType.COLLAPSED_SUBPROCESS,
+    }:
+        code_values = [value for value, normalized in zip(values, normalized_values) if _is_activity_code_text(normalized)]
+        descriptive_values = [
+            value
+            for value, normalized in zip(values, normalized_values)
+            if normalized and not _is_activity_code_text(normalized) and not _is_branch_label_text(normalized)
+        ]
+        if descriptive_values and code_values:
+            values = code_values[:1] + descriptive_values
+        elif descriptive_values:
+            values = descriptive_values
+        elif code_values:
+            values = code_values[:1]
 
     if header_hits and footer_hits and node.node_type == NodeType.TASK:
         metadata["force_task"] = True
@@ -1977,9 +2216,14 @@ def _line_vertical_region(node: DiagramNode, line: OcrLine) -> str:
     if node.height <= 0:
         return "center"
     relative_center = ((line.y + (line.height / 2.0)) - node.y) / node.height
-    if relative_center <= 0.26:
+    top_threshold = 0.26
+    bottom_threshold = 0.78
+    if (node.metadata or {}).get("layout_hint") == "banded_activity":
+        top_threshold = 0.34
+        bottom_threshold = 0.74
+    if relative_center <= top_threshold:
         return "top"
-    if relative_center >= 0.78:
+    if relative_center >= bottom_threshold:
         return "bottom"
     return "center"
 
@@ -1991,6 +2235,8 @@ def _is_ignored_header_text(text: str, region: str) -> bool:
     if not normalized:
         return False
     if "|" in text:
+        return True
+    if _is_activity_code_text(normalized):
         return True
     if re.search(r"\b\d{1,3}$", normalized):
         return True
@@ -2015,6 +2261,20 @@ def _is_ignored_footer_text(text: str) -> bool:
     if not normalized:
         return False
     return normalized in {"responsable", "cailero responsable", "caiero responsable"}
+
+
+def _is_branch_label_text(normalized: str) -> bool:
+    return normalized in {"si", "no", "yes", "true", "false"}
+
+
+def _is_activity_code_text(normalized: str) -> bool:
+    if not normalized:
+        return False
+    compact = normalized.replace(" ", "")
+    return bool(
+        re.fullmatch(r"(sp|mp[afc]?|ap|rp|op|bp)\d{1,3}", compact)
+        or re.fullmatch(r"(sp|mp[afc]?|ap|rp|op|bp)-?\d{1,3}", compact)
+    )
 
 
 def _is_global_document_header_text(text: str, y: float, image_height: int) -> bool:
@@ -2395,7 +2655,11 @@ def _intersection_area(
     return (right - left) * (bottom - top)
 
 
-def _detect_connectors(image_path: Path, nodes: list[DiagramNode]) -> list[DiagramEdge]:
+def _detect_connectors(
+    image_path: Path,
+    nodes: list[DiagramNode],
+    sketch_mode: bool = False,
+) -> list[DiagramEdge]:
     if len(nodes) < 2:
         return []
     try:
@@ -2403,16 +2667,18 @@ def _detect_connectors(image_path: Path, nodes: list[DiagramNode]) -> list[Diagr
     except ImportError as exc:
         raise RuntimeError("OpenCV es requerido para detectar conectores.") from exc
 
-    image = cv2.imread(str(image_path))
+    image = cv2_imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"No se pudo abrir la imagen rasterizada: {image_path}")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges_image = cv2.Canny(gray, 50, 150, apertureSize=3)
+    edges_image = cv2.Canny(gray, 35 if sketch_mode else 50, 120 if sketch_mode else 150, apertureSize=3)
     lines = cv2.HoughLinesP(
         edges_image,
         rho=1,
         theta=math.pi / 180,
-        threshold=80,
-        minLineLength=40,
-        maxLineGap=20,
+        threshold=55 if sketch_mode else 80,
+        minLineLength=26 if sketch_mode else 40,
+        maxLineGap=36 if sketch_mode else 20,
     )
     if lines is None:
         return []
@@ -2453,7 +2719,9 @@ def _detect_data_store_candidates(
     except ImportError as exc:
         raise RuntimeError("OpenCV es requerido para detectar depositos de datos.") from exc
 
-    image = cv2.imread(str(image_path))
+    image = cv2_imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"No se pudo abrir la imagen rasterizada: {image_path}")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     binary = cv2.adaptiveThreshold(
@@ -2525,7 +2793,7 @@ def _detect_collapsed_marker(image_path: Path, node: DiagramNode) -> bool:
     if node.width < 90 or node.height < 45:
         return False
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    image = cv2_imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         return False
 
@@ -2564,7 +2832,7 @@ def _detect_boundary_event_candidates(
     except ImportError as exc:
         raise RuntimeError("OpenCV es requerido para detectar boundary events.") from exc
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    image = cv2_imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         return []
     blurred = cv2.GaussianBlur(image, (7, 7), 0)

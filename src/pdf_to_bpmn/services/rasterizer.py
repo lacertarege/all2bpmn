@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pdf_to_bpmn.services.image_io import cv2_imread, cv2_imwrite
+
 
 class SinglePagePdfRasterizer:
     def __init__(self, dpi: int = 300) -> None:
@@ -44,9 +46,9 @@ class SinglePagePdfRasterizer:
             ) from exc
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image = cv2_imread(image_path, cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError(f"No se pudo abrir la imagen de entrada: {image_path}")
-        if not cv2.imwrite(str(output_path), image):
+        if not cv2_imwrite(output_path, image):
             raise RuntimeError(f"No se pudo normalizar la imagen de entrada: {image_path}")
         return output_path

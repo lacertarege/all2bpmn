@@ -611,6 +611,17 @@ class DiagramScene(QGraphicsScene):
         self.clearSelection()
         item.setSelected(True)
 
+    def select_entities(self, node_ids: list[str] | set[str], edge_ids: list[str] | set[str]) -> None:
+        self.clearSelection()
+        for node_id in node_ids:
+            item = self.node_items.get(node_id)
+            if item:
+                item.setSelected(True)
+        for edge_id in edge_ids:
+            item = self.edge_items.get(edge_id)
+            if item:
+                item.setSelected(True)
+
     def _on_node_moved(self, node_id: str) -> None:
         self._refresh_edges_for(node_id)
         self.changed_model.emit()

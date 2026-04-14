@@ -90,15 +90,15 @@ def main(argv: list[str] | None = None) -> int:
 def _write_blank_png(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import cv2
         import numpy as np
     except ImportError as exc:
         raise RuntimeError(
             "OpenCV y numpy son necesarios para inicializar la imagen en blanco de la UI."
         ) from exc
+    from pdf_to_bpmn.services.image_io import cv2_imwrite
 
     blank = np.full((900, 1600, 3), 255, dtype=np.uint8)
-    if not cv2.imwrite(str(destination), blank):
+    if not cv2_imwrite(destination, blank):
         raise RuntimeError(f"No se pudo crear la imagen en blanco: {destination}")
 
 

@@ -8,6 +8,40 @@ from pdf_to_bpmn.domain import DiagramDocument, DiagramEdge, DiagramNode, EdgeTy
 class BizagiStrictValidator:
     PROFILE = "bizagi-strict"
 
+    def normalize_for_bizagi(self, diagram: DiagramDocument) -> None:
+        nodes_by_id = {node.id: node for node in diagram.nodes if not node.deleted}
+        pools = [node for node in nodes_by_id.values() if node.node_type == NodeType.POOL]
+        lanes = [node for node in nodes_by_id.values() if node.node_type == NodeType.LANE]
+
+        for lane in lanes:
+            if lane.parent_id and nodes_by_id.get(lane.parent_id, None) and nodes_by_id[lane.parent_id].node_type == NodeType.POOL:
+                continue
+            parent_pool = self._smallest_container(lane, pools)
+            if parent_pool is None and len(pools) == 1:
+                parent_pool = pools[0]
+            lane.parent_id = parent_pool.id if parent_pool else None
+
+        for node in nodes_by_id.values():
+            if node.node_type in {NodeType.POOL, NodeType.LANE}:
+                continue
+            if node.node_type == NodeType.BOUNDARY_EVENT:
+                attached_to = str((node.metadata or {}).get("attached_to") or "").strip()
+                attached_node = nodes_by_id.get(attached_to)
+                if attached_node is not None:
+                    node.parent_id = attached_node.parent_id
+                continue
+            if self._pool_owner(node, nodes_by_id):
+                continue
+            lane_parent = self._smallest_container(node, lanes)
+            if lane_parent is not None:
+                node.parent_id = lane_parent.id
+                continue
+            pool_parent = self._smallest_container(node, pools)
+            if pool_parent is None and len(pools) == 1:
+                pool_parent = pools[0]
+            if pool_parent is not None:
+                node.parent_id = pool_parent.id
+
     def validate(self, diagram: DiagramDocument) -> list[ReviewIssue]:
         issues: list[ReviewIssue] = []
         nodes_by_id = {node.id: node for node in diagram.nodes if not node.deleted}
@@ -21,11 +55,32 @@ class BizagiStrictValidator:
         return issues
 
     def sync_issues(self, diagram: DiagramDocument) -> list[ReviewIssue]:
+        self.normalize_for_bizagi(diagram)
+        existing_resolution = {
+            (
+                issue.severity,
+                issue.message,
+                issue.related_kind,
+                issue.related_id,
+            ): issue.resolved
+            for issue in diagram.issues
+            if issue.metadata.get("profile") == self.PROFILE
+        }
         diagram.issues = [
             issue for issue in diagram.issues
             if issue.metadata.get("profile") != self.PROFILE
         ]
         issues = self.validate(diagram)
+        for issue in issues:
+            issue.resolved = existing_resolution.get(
+                (
+                    issue.severity,
+                    issue.message,
+                    issue.related_kind,
+                    issue.related_id,
+                ),
+                False,
+            )
         diagram.issues.extend(issues)
         return issues
 
@@ -202,6 +257,22 @@ class BizagiStrictValidator:
                 return parent
             current = parent
         return None
+
+    def _smallest_container(self, node: DiagramNode, containers: list[DiagramNode]) -> DiagramNode | None:
+        matches = [candidate for candidate in containers if candidate.id != node.id and self._contains(candidate, node)]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item.width * item.height)
+        return matches[0]
+
+    def _contains(self, container: DiagramNode, node: DiagramNode) -> bool:
+        margin = 6.0
+        return (
+            node.x >= container.x - margin
+            and node.y >= container.y - margin
+            and (node.x + node.width) <= (container.x + container.width + margin)
+            and (node.y + node.height) <= (container.y + container.height + margin)
+        )
 
     def _issue(
         self,

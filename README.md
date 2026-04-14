@@ -42,7 +42,12 @@ pip install -e .
 
 ## Variables de entorno
 
-El proyecto intenta cargar primero `.env` y, si no existe una variable, usa `.env.example` como fallback. Puedes tomar como base el archivo [.env.example](/mnt/e/pdf%20to%20bpmn/.env.example).
+El proyecto intenta cargar variables en este orden:
+
+- `.env` y `.env.example` en el directorio actual;
+- si esta empaquetado como `.exe`, tambien busca `.env` y `.env.example` junto al ejecutable.
+
+Puedes tomar como base el archivo [.env.example](/mnt/e/pdf%20to%20bpmn/.env.example).
 
 Variables principales:
 
@@ -81,6 +86,37 @@ En cada exportacion se generan:
 
 - `diagrama.bpmn`: modelo BPMN 2.0 semantico;
 - `diagrama.vsdx`: diagrama editable en Visio.
+
+## Empaquetado a EXE
+
+Puedes generar una carpeta distribuible para otra PC con:
+
+```powershell
+cd "E:\pdf to bpmn"
+.venv\Scripts\Activate.ps1
+.\build_exe.ps1
+```
+
+Salida esperada:
+
+- `dist\all2bpmn\all2bpmn.exe`
+- `dist\all2bpmn\.env.example`
+
+Para usar API keys en otra PC:
+
+1. copia `dist\all2bpmn` completa;
+2. crea un archivo `.env` junto a `all2bpmn.exe`;
+3. completa alli tus variables `AZURE_*`, `VISIO_*`, `OPEN_BPMN_*`.
+
+Ejemplo:
+
+```env
+AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=https://tu-endpoint.cognitiveservices.azure.com
+AZURE_DOCUMENT_INTELLIGENCE_KEY=tu_clave
+AZURE_FOUNDRY_ENDPOINT=https://tu-foundry.openai.azure.com
+AZURE_FOUNDRY_API_KEY=tu_clave
+AZURE_FOUNDRY_DEPLOYMENT=tu_deployment
+```
 
 ## Flujo de revision
 

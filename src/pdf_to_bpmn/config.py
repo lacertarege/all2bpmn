@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,19 +26,39 @@ def _prepare_data_dir(raw_value: str) -> Path:
 
 
 def _load_dotenv_files() -> None:
-    cwd = Path.cwd()
-    for candidate in (cwd / ".env", cwd / ".env.example"):
-        if not candidate.exists():
-            continue
-        for raw_line in candidate.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
+    for base_dir in _dotenv_search_dirs():
+        for candidate in (base_dir / ".env", base_dir / ".env.example"):
+            if not candidate.exists():
                 continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip("'").strip('"')
-            if key and key not in os.environ:
-                os.environ[key] = value
+            for raw_line in candidate.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+                if key and key not in os.environ:
+                    os.environ[key] = value
+
+
+def _dotenv_search_dirs() -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Path | None) -> None:
+        if path is None:
+            return
+        resolved = path.expanduser().resolve()
+        key = str(resolved).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(resolved)
+
+    add(Path.cwd())
+    add(Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None)
+    add(Path(__file__).resolve().parents[2])
+    return candidates
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
